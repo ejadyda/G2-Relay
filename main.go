@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
@@ -103,41 +103,25 @@ func isWebSocket(r *http.Request) bool {
 	return strings.Contains(connection, "upgrade") && upgrade == "websocket"
 }
 
-func pipeThenClose(dst net.Conn, src net.Conn, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
-	_ = dst.Close()
-	_ = src.Close()
-
-	select {
-	case done <- struct{}{}:
-	default:
-	}
-}
-
-func copyBufferedToTarget(targetConn net.Conn, rw *bufio.ReadWriter) {
-	if rw == nil || rw.Reader == nil {
-		return
-	}
-
-	if rw.Reader.Buffered() <= 0 {
-		return
-	}
-
-	_, _ = io.CopyN(targetConn, rw, int64(rw.Reader.Buffered()))
-}
-
+// tunnelWebSocket forwards WebSocket connections by hijacking and piping data bidirectionally.
 func tunnelWebSocket(cfg Config, w http.ResponseWriter, r *http.Request) {
+	log.Printf("[WS] New WebSocket request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	log.Printf("[WS] Connection: %s, Upgrade: %s", r.Header.Get("Connection"), r.Header.Get("Upgrade"))
+	log.Printf("[WS] Host header: %s", r.Header.Get("Host"))
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		log.Printf("[WS] ERROR: hijacking not supported")
 		http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
 		return
 	}
 
 	targetAddr := net.JoinHostPort(cfg.TargetHost, cfg.TargetPort)
+	log.Printf("[WS] Dialing target: %s", targetAddr)
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 15*time.Second)
 	if err != nil {
-		log.Printf("[WS] dial target error: %v", err)
+		log.Printf("[WS] ERROR: failed to dial target: %v", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -145,52 +129,79 @@ func tunnelWebSocket(cfg Config, w http.ResponseWriter, r *http.Request) {
 	clientConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		_ = targetConn.Close()
-		log.Printf("[WS] hijack error: %v", err)
+		log.Printf("[WS] ERROR: hijack failed: %v", err)
 		return
 	}
 
-	// Keep original Host from Codespaces.
-	// This is important because the client reaches GitHub Codespaces with that Host.
-	r.RequestURI = r.URL.RequestURI()
-
+	// Write the incoming HTTP request to the target connection, preserving the original Host.
+	// RequestURI must be empty for proxy requests.
 	if err := r.Write(targetConn); err != nil {
 		_ = clientConn.Close()
 		_ = targetConn.Close()
-		log.Printf("[WS] write upgrade request error: %v", err)
+		log.Printf("[WS] ERROR: failed to write upgrade request to target: %v", err)
 		return
 	}
 
-	copyBufferedToTarget(targetConn, rw)
+	// Copy any buffered data that hasn't been sent yet.
+	if rw.Reader != nil && rw.Reader.Buffered() > 0 {
+		if n, err := io.CopyN(targetConn, rw.Reader, int64(rw.Reader.Buffered())); err != nil && err != io.EOF {
+			log.Printf("[WS] WARNING: buffered copy error: %v", err)
+		} else if n > 0 {
+			log.Printf("[WS] Copied %d buffered bytes to target", n)
+		}
+	}
 
-	log.Printf("[WS] %s %s Host=%s -> %s", r.RemoteAddr, r.URL.Path, r.Host, targetAddr)
+	log.Printf("[WS] Tunnel established: %s -> %s", r.RemoteAddr, targetAddr)
 
+	// Pipe data bidirectionally until connection closes.
 	done := make(chan struct{}, 2)
 
-	go pipeThenClose(targetConn, clientConn, done)
-	go pipeThenClose(clientConn, targetConn, done)
+	go func() {
+		_, _ = io.Copy(targetConn, clientConn)
+		_ = targetConn.Close()
+		_ = clientConn.Close()
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}()
 
+	go func() {
+		_, _ = io.Copy(clientConn, targetConn)
+		_ = clientConn.Close()
+		_ = targetConn.Close()
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}()
+
+	// Wait for at least one goroutine to finish (indicates connection closed).
 	<-done
+	log.Printf("[WS] Tunnel closed: %s", r.RemoteAddr)
 }
 
-func proxyHTTP(cfg Config, w http.ResponseWriter, r *http.Request) {
-	targetURL := &url.URL{
-		Scheme:   cfg.TargetScheme,
-		Host:     net.JoinHostPort(cfg.TargetHost, cfg.TargetPort),
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-	}
+// proxyHTTP forwards HTTP requests using ReverseProxy.
+func proxyHTTP(cfg Config, targetURL *url.URL) http.Handler {
+	return &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			log.Printf("[HTTP] Incoming request: %s %s from %s", req.Method, req.URL.Path, req.RemoteAddr)
+			log.Printf("[HTTP] Host header: %s", req.Header.Get("Host"))
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "failed to build upstream request", http.StatusBadGateway)
-		return
-	}
+			// Update the request to point to the target.
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			// Preserve the original path and query.
 
-	req.Header = r.Header.Clone()
-	req.Host = r.Host
+			// Preserve the original Host header from the incoming request.
+			// req.Host = req.URL.Host  (already set by ReverseProxy)
 
-	client := &http.Client{
-		Timeout: 0,
+			log.Printf("[HTTP] Target URL: %s", req.URL.String())
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[HTTP] Proxy error: %v", err)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			MaxIdleConns:          4096,
@@ -200,23 +211,6 @@ func proxyHTTP(cfg Config, w http.ResponseWriter, r *http.Request) {
 			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[HTTP] proxy error: %v", err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
 func main() {
@@ -224,59 +218,71 @@ func main() {
 
 	publicHost := codespacesPublicHost(cfg.ListenAddr)
 
-	clientAddress := publicHost
-	if cfg.ClientAddressOverride != "" {
-		clientAddress = cfg.ClientAddressOverride
+	targetURL := &url.URL{
+		Scheme: cfg.TargetScheme,
+		Host:   net.JoinHostPort(cfg.TargetHost, cfg.TargetPort),
 	}
 
 	target := fmt.Sprintf("%s://%s", cfg.TargetScheme, net.JoinHostPort(cfg.TargetHost, cfg.TargetPort))
 
 	log.Println("============================================================")
 	log.Println("g2ray-lite-forwarder-go started")
-	log.Printf("Listen: %s", cfg.ListenAddr)
-	log.Printf("Target: %s", target)
+	log.Printf("Listen:      %s", cfg.ListenAddr)
+	log.Printf("Target:      %s", target)
+	log.Printf("Target Host: %s", cfg.TargetHost)
+	log.Printf("Target Port: %s", cfg.TargetPort)
 
 	if publicHost != "" {
 		log.Printf("Codespaces Host: %s", publicHost)
-		log.Printf("Public URL: https://%s", publicHost)
+		log.Printf("Public URL:      https://%s", publicHost)
 	} else {
-		log.Println("Codespaces Host: not detected")
+		log.Println("Codespaces Host: not detected (running locally)")
 	}
 
 	if cfg.VlessUUID == "" {
 		log.Println("")
-		log.Println("VLESS_UUID is empty.")
-		log.Println("Set VLESS_UUID as a GitHub Codespaces Secret.")
+		log.Println("⚠️  VLESS_UUID is empty.")
+		log.Println("Set VLESS_UUID environment variable or GitHub Codespaces Secret.")
 	} else if publicHost != "" {
 		log.Println("")
-		log.Println("Final VLESS link using Codespaces domain as address:")
+		log.Println("📝 Final VLESS link (Codespaces domain as address):")
 		log.Println(buildVlessLink(cfg, publicHost, publicHost))
 
 		if cfg.ClientAddressOverride != "" {
 			log.Println("")
-			log.Println("Final VLESS link using CLIENT_ADDRESS_OVERRIDE:")
+			log.Println("📝 Final VLESS link (CLIENT_ADDRESS_OVERRIDE as address):")
 			log.Println(buildVlessLink(cfg, publicHost, cfg.ClientAddressOverride))
 		}
+	}
+
+	log.Println("")
+	log.Println("🔍 Troubleshooting:")
+	log.Println("  curl -I http://127.0.0.1:3000/health")
+	if publicHost != "" {
+		log.Printf("  curl -I https://%s/health", publicHost)
+		log.Printf("  curl -I --resolve %s:443:94.130.50.12 https://%s/health", publicHost, publicHost)
 	}
 
 	log.Println("============================================================")
 
 	mux := http.NewServeMux()
 
+	// Health check endpoint - no proxying.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[HEALTH] %s from %s", r.Method, r.RemoteAddr)
 		w.Header().Set("content-type", "text/plain; charset=utf-8")
 		w.Header().Set("cache-control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
+	// Main handler: route WebSocket or HTTP requests.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if isWebSocket(r) {
 			tunnelWebSocket(cfg, w, r)
-			return
+		} else {
+			proxyHTTP(cfg, targetURL).ServeHTTP(w, r)
 		}
-
-		proxyHTTP(cfg, w, r)
 	})
 
 	server := &http.Server{
@@ -285,6 +291,7 @@ func main() {
 		ReadHeaderTimeout: 20 * time.Second,
 	}
 
+	log.Printf("Listening on %s...", cfg.ListenAddr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
