@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,8 @@ type Config struct {
 	VlessUUID string
 	VlessPath string
 	LinkName  string
+
+	ClientAddressOverride string
 }
 
 func env(key, fallback string) string {
@@ -42,7 +45,11 @@ func loadConfig() Config {
 
 		VlessUUID: env("VLESS_UUID", ""),
 		VlessPath: env("VLESS_PATH", "/"),
-		LinkName:  env("LINK_NAME", "g2ray-lite"),
+		LinkName:  env("LINK_NAME", "g2ray-lwq4w11y"),
+
+		// Optional.
+		// Example: 94.130.50.12
+		ClientAddressOverride: env("CLIENT_ADDRESS_OVERRIDE", ""),
 	}
 }
 
@@ -66,77 +73,57 @@ func codespacesPublicHost(listenAddr string) string {
 	return fmt.Sprintf("%s-%s.%s", codespaceName, port, domain)
 }
 
-func buildVlessLink(cfg Config, publicHost string) string {
-	if cfg.VlessUUID == "" || publicHost == "" {
+func buildVlessLink(cfg Config, publicHost string, address string) string {
+	if cfg.VlessUUID == "" || publicHost == "" || address == "" {
 		return ""
 	}
 
 	values := url.Values{}
-	values.Set("type", "ws")
 	values.Set("encryption", "none")
 	values.Set("security", "tls")
-	values.Set("path", cfg.VlessPath)
-	values.Set("host", publicHost)
 	values.Set("sni", publicHost)
+	values.Set("fp", "chrome")
+	values.Set("type", "ws")
+	values.Set("host", publicHost)
+	values.Set("path", cfg.VlessPath)
 
 	return fmt.Sprintf(
 		"vless://%s@%s:443?%s#%s",
 		cfg.VlessUUID,
-		publicHost,
+		address,
 		values.Encode(),
 		url.QueryEscape(cfg.LinkName),
 	)
 }
 
-func copyHeader(dst, src http.Header) {
-	for key, values := range src {
-		for _, value := range values {
-			dst.Add(key, value)
-		}
+func isWebSocket(r *http.Request) bool {
+	connection := strings.ToLower(r.Header.Get("Connection"))
+	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
+
+	return strings.Contains(connection, "upgrade") && upgrade == "websocket"
+}
+
+func pipeThenClose(dst net.Conn, src net.Conn, done chan<- struct{}) {
+	_, _ = io.Copy(dst, src)
+	_ = dst.Close()
+	_ = src.Close()
+
+	select {
+	case done <- struct{}{}:
+	default:
 	}
 }
 
-func reverseProxyHTTP(cfg Config, w http.ResponseWriter, r *http.Request) {
-	targetURL := &url.URL{
-		Scheme:   cfg.TargetScheme,
-		Host:     net.JoinHostPort(cfg.TargetHost, cfg.TargetPort),
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
-	if err != nil {
-		http.Error(w, "failed to build request", http.StatusBadGateway)
+func copyBufferedToTarget(targetConn net.Conn, rw *bufio.ReadWriter) {
+	if rw == nil || rw.Reader == nil {
 		return
 	}
 
-	req.Header = r.Header.Clone()
-	req.Host = r.Host
-
-	client := &http.Client{
-		Timeout: 0,
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			MaxIdleConns:          1024,
-			MaxIdleConnsPerHost:   1024,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[HTTP] proxy error: %v", err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+	if rw.Reader.Buffered() <= 0 {
 		return
 	}
-	defer resp.Body.Close()
 
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = io.CopyN(targetConn, rw, int64(rw.Reader.Buffered()))
 }
 
 func tunnelWebSocket(cfg Config, w http.ResponseWriter, r *http.Request) {
@@ -155,53 +142,92 @@ func tunnelWebSocket(cfg Config, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		_ = targetConn.Close()
 		log.Printf("[WS] hijack error: %v", err)
 		return
 	}
 
-	err = r.Write(targetConn)
-	if err != nil {
+	// Keep original Host from Codespaces.
+	// This is important because the client reaches GitHub Codespaces with that Host.
+	r.RequestURI = r.URL.RequestURI()
+
+	if err := r.Write(targetConn); err != nil {
 		_ = clientConn.Close()
 		_ = targetConn.Close()
 		log.Printf("[WS] write upgrade request error: %v", err)
 		return
 	}
 
-	log.Printf("[WS] %s %s -> %s", r.RemoteAddr, r.URL.Path, targetAddr)
+	copyBufferedToTarget(targetConn, rw)
 
-	errc := make(chan error, 2)
+	log.Printf("[WS] %s %s Host=%s -> %s", r.RemoteAddr, r.URL.Path, r.Host, targetAddr)
 
-	go func() {
-		_, err := io.Copy(targetConn, clientConn)
-		errc <- err
-	}()
+	done := make(chan struct{}, 2)
 
-	go func() {
-		_, err := io.Copy(clientConn, targetConn)
-		errc <- err
-	}()
+	go pipeThenClose(targetConn, clientConn, done)
+	go pipeThenClose(clientConn, targetConn, done)
 
-	<-errc
-
-	_ = clientConn.Close()
-	_ = targetConn.Close()
+	<-done
 }
 
-func isWebSocket(r *http.Request) bool {
-	connection := strings.ToLower(r.Header.Get("Connection"))
-	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
+func proxyHTTP(cfg Config, w http.ResponseWriter, r *http.Request) {
+	targetURL := &url.URL{
+		Scheme:   cfg.TargetScheme,
+		Host:     net.JoinHostPort(cfg.TargetHost, cfg.TargetPort),
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
 
-	return strings.Contains(connection, "upgrade") && upgrade == "websocket"
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "failed to build upstream request", http.StatusBadGateway)
+		return
+	}
+
+	req.Header = r.Header.Clone()
+	req.Host = r.Host
+
+	client := &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          4096,
+			MaxIdleConnsPerHost:   4096,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[HTTP] proxy error: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func main() {
 	cfg := loadConfig()
 
 	publicHost := codespacesPublicHost(cfg.ListenAddr)
-	vlessLink := buildVlessLink(cfg, publicHost)
+
+	clientAddress := publicHost
+	if cfg.ClientAddressOverride != "" {
+		clientAddress = cfg.ClientAddressOverride
+	}
 
 	target := fmt.Sprintf("%s://%s", cfg.TargetScheme, net.JoinHostPort(cfg.TargetHost, cfg.TargetPort))
 
@@ -211,19 +237,26 @@ func main() {
 	log.Printf("Target: %s", target)
 
 	if publicHost != "" {
+		log.Printf("Codespaces Host: %s", publicHost)
 		log.Printf("Public URL: https://%s", publicHost)
 	} else {
-		log.Println("Public URL: not running inside GitHub Codespaces")
+		log.Println("Codespaces Host: not detected")
 	}
 
-	if vlessLink != "" {
-		log.Println("")
-		log.Println("Final VLESS link:")
-		log.Println(vlessLink)
-	} else {
+	if cfg.VlessUUID == "" {
 		log.Println("")
 		log.Println("VLESS_UUID is empty.")
-		log.Println("Set VLESS_UUID as a GitHub Codespaces Secret or environment variable to print the final link.")
+		log.Println("Set VLESS_UUID as a GitHub Codespaces Secret.")
+	} else if publicHost != "" {
+		log.Println("")
+		log.Println("Final VLESS link using Codespaces domain as address:")
+		log.Println(buildVlessLink(cfg, publicHost, publicHost))
+
+		if cfg.ClientAddressOverride != "" {
+			log.Println("")
+			log.Println("Final VLESS link using CLIENT_ADDRESS_OVERRIDE:")
+			log.Println(buildVlessLink(cfg, publicHost, cfg.ClientAddressOverride))
+		}
 	}
 
 	log.Println("============================================================")
@@ -243,7 +276,7 @@ func main() {
 			return
 		}
 
-		reverseProxyHTTP(cfg, w, r)
+		proxyHTTP(cfg, w, r)
 	})
 
 	server := &http.Server{
