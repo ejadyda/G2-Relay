@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Set defaults for proxy configuration
-export LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:3000}"
-export TARGET_HOST="${TARGET_HOST:-212.95.41.118}"
-export TARGET_PORT="${TARGET_PORT:-48560}"
-export TARGET_SCHEME="${TARGET_SCHEME:-http}"
-export VLESS_PATH="${VLESS_PATH:-/}"
-export LINK_NAME="${LINK_NAME:-g2ray-lwq4w11y}"
-
 # Logging helpers
 log_info() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ℹ️  $*"
@@ -56,24 +48,6 @@ make_port_public() {
 make_port_public &
 
 log_info "Starting g2ray-lite-forwarder..."
-log_info "Configuration:"
-log_info "  LISTEN_ADDR:       $LISTEN_ADDR"
-log_info "  TARGET_HOST:       $TARGET_HOST"
-log_info "  TARGET_PORT:       $TARGET_PORT"
-log_info "  TARGET_SCHEME:     $TARGET_SCHEME"
-log_info "  VLESS_PATH:        $VLESS_PATH"
-log_info "  LINK_NAME:         $LINK_NAME"
-
-if [ -n "${CLIENT_ADDRESS_OVERRIDE:-}" ]; then
-  log_info "  CLIENT_OVERRIDE:   $CLIENT_ADDRESS_OVERRIDE"
-fi
-
-if [ -z "${VLESS_UUID:-}" ]; then
-  log_warn "VLESS_UUID is empty; final VLESS link may not be printed"
-else
-  log_success "VLESS_UUID is loaded from environment"
-fi
-
 echo
 
 # Run the Go proxy

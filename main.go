@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,86 +15,38 @@ import (
 )
 
 type Config struct {
-	ListenAddr string
-
-	TargetHost   string
-	TargetPort   string
-	TargetScheme string
-
-	VlessUUID string
-	VlessPath string
-	LinkName  string
-
-	ClientAddressOverride string
+	ListenAddr   string `json:"listen_addr"`
+	TargetHost   string `json:"target_host"`
+	TargetPort   string `json:"target_port"`
+	TargetScheme string `json:"target_scheme"`
 }
 
-func env(key, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-func loadConfig() Config {
-	return Config{
-		ListenAddr: env("LISTEN_ADDR", "0.0.0.0:3000"),
-
-		TargetHost:   env("TARGET_HOST", "212.95.41.118"),
-		TargetPort:   env("TARGET_PORT", "48560"),
-		TargetScheme: env("TARGET_SCHEME", "http"),
-
-		VlessUUID: env("VLESS_UUID", ""),
-		VlessPath: env("VLESS_PATH", "/"),
-		LinkName:  env("LINK_NAME", "g2ray-lwq4w11y"),
-
-		// Optional.
-		// Example: 94.130.50.12
-		ClientAddressOverride: env("CLIENT_ADDRESS_OVERRIDE", ""),
-	}
-}
-
-func codespacesPublicHost(listenAddr string) string {
-	codespaceName := strings.TrimSpace(os.Getenv("CODESPACE_NAME"))
-	domain := strings.TrimSpace(os.Getenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN"))
-
-	if codespaceName == "" {
-		return ""
-	}
-
-	if domain == "" {
-		domain = "app.github.dev"
-	}
-
-	_, port, err := net.SplitHostPort(listenAddr)
+func loadConfigFromFile(filePath string) (Config, error) {
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		port = "3000"
+		return Config{}, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	return fmt.Sprintf("%s-%s.%s", codespaceName, port, domain)
-}
-
-func buildVlessLink(cfg Config, publicHost string, address string) string {
-	if cfg.VlessUUID == "" || publicHost == "" || address == "" {
-		return ""
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	values := url.Values{}
-	values.Set("encryption", "none")
-	values.Set("security", "tls")
-	values.Set("sni", publicHost)
-	values.Set("fp", "chrome")
-	values.Set("type", "ws")
-	values.Set("host", publicHost)
-	values.Set("path", cfg.VlessPath)
+	// Validate required fields
+	if cfg.ListenAddr == "" {
+		return Config{}, fmt.Errorf("listen_addr is required in config.json")
+	}
+	if cfg.TargetHost == "" {
+		return Config{}, fmt.Errorf("target_host is required in config.json")
+	}
+	if cfg.TargetPort == "" {
+		return Config{}, fmt.Errorf("target_port is required in config.json")
+	}
+	if cfg.TargetScheme == "" {
+		return Config{}, fmt.Errorf("target_scheme is required in config.json")
+	}
 
-	return fmt.Sprintf(
-		"vless://%s@%s:443?%s#%s",
-		cfg.VlessUUID,
-		address,
-		values.Encode(),
-		url.QueryEscape(cfg.LinkName),
-	)
+	return cfg, nil
 }
 
 func isWebSocket(r *http.Request) bool {
@@ -214,9 +167,10 @@ func proxyHTTP(cfg Config, targetURL *url.URL) http.Handler {
 }
 
 func main() {
-	cfg := loadConfig()
-
-	publicHost := codespacesPublicHost(cfg.ListenAddr)
+	cfg, err := loadConfigFromFile("config.json")
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
 
 	targetURL := &url.URL{
 		Scheme: cfg.TargetScheme,
@@ -227,42 +181,9 @@ func main() {
 
 	log.Println("============================================================")
 	log.Println("g2ray-lite-forwarder-go started")
-	log.Printf("Listen:      %s", cfg.ListenAddr)
-	log.Printf("Target:      %s", target)
-	log.Printf("Target Host: %s", cfg.TargetHost)
-	log.Printf("Target Port: %s", cfg.TargetPort)
-
-	if publicHost != "" {
-		log.Printf("Codespaces Host: %s", publicHost)
-		log.Printf("Public URL:      https://%s", publicHost)
-	} else {
-		log.Println("Codespaces Host: not detected (running locally)")
-	}
-
-	if cfg.VlessUUID == "" {
-		log.Println("")
-		log.Println("⚠️  VLESS_UUID is empty.")
-		log.Println("Set VLESS_UUID environment variable or GitHub Codespaces Secret.")
-	} else if publicHost != "" {
-		log.Println("")
-		log.Println("📝 Final VLESS link (Codespaces domain as address):")
-		log.Println(buildVlessLink(cfg, publicHost, publicHost))
-
-		if cfg.ClientAddressOverride != "" {
-			log.Println("")
-			log.Println("📝 Final VLESS link (CLIENT_ADDRESS_OVERRIDE as address):")
-			log.Println(buildVlessLink(cfg, publicHost, cfg.ClientAddressOverride))
-		}
-	}
-
-	log.Println("")
-	log.Println("🔍 Troubleshooting:")
-	log.Println("  curl -I http://127.0.0.1:3000/health")
-	if publicHost != "" {
-		log.Printf("  curl -I https://%s/health", publicHost)
-		log.Printf("  curl -I --resolve %s:443:94.130.50.12 https://%s/health", publicHost, publicHost)
-	}
-
+	log.Printf("Loaded config from: config.json")
+	log.Printf("Listen:  %s", cfg.ListenAddr)
+	log.Printf("Target:  %s", target)
 	log.Println("============================================================")
 
 	mux := http.NewServeMux()

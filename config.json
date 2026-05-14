@@ -1,0 +1,6 @@
+{
+  "listen_addr": "0.0.0.0:3000",
+  "target_host": "212.95.41.118",
+  "target_port": "48560",
+  "target_scheme": "http"
+}
